@@ -1,4 +1,4 @@
-# Development interpretability experiment
+# Developmental interpretability experiment
 
 This is the codebase accompaniment to the post [Training Process Transparency through Gradient Interpretability](https://www.lesswrong.com/posts/DtkA5jysFZGv7W4qP/training-process-transparency-through-gradient).
 
