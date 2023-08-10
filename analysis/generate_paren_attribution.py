@@ -18,7 +18,7 @@ num_epochs = 5
 num_batches = 2920
 batch_size = 20
 training_item = namedtuple("training_item", "id datum")
-prefix = "single-step/"
+prefix = "single-step-parens/"
 
 def read_metadata(epoch: int):
     with open(f"{prefix}grads_{epoch}.json", "r") as f:
@@ -68,21 +68,24 @@ def read_grads(path: str) -> Tensor:
     with open(path, "rb") as f:
         return pickle.loads(f.read()).to("cuda")
 
-if __name__ == "__main__":
-    num_layers = 3
 
+if __name__ == "__main__":
     metadata_per_epoch = {
         epoch: [add_training_identifier(m) for m in read_metadata(epoch)] for epoch in range(1, num_epochs + 1)
     }
 
     training_ids = sorted(list(set(y.id for m in metadata_per_epoch.values() for x in m for y in x["data_batch"])))
 
+    num_layers = 3
+
     full_data_attribution = []
     topk_cutoff = 1000
-    output_prefix = os.path.join(prefix, "analysis", str(topk_cutoff))
+    output_prefix = f"{prefix}analysis/{topk_cutoff}"
     output_columns = []
 
     count = 0
+
+    os.makedirs(output_prefix, exist_ok=True)
 
     for epoch in tqdm.tqdm(range(1, num_epochs + 1), total=num_epochs):
         for batch_num in tqdm.tqdm(range(0, num_batches), total=num_batches):
@@ -97,6 +100,7 @@ if __name__ == "__main__":
             for i in range(0, batch_size):
                 rows = []
                 full_prefix = os.path.join(prefix, f"grads_{epoch}", str(batch_num), str(i))
+                
                 tensors = {}
                 for dir, dirs, files in os.walk(full_prefix):
                     for file in files:
@@ -114,7 +118,7 @@ if __name__ == "__main__":
                     continue
 
                 # Top 1000 most significant parameter updates
-                top_params = collect_top_parameters(tensors, n=1000).sort_values("value", ascending=False)
+                top_params = collect_top_parameters(tensors, n=topk_cutoff).sort_values("value", ascending=False)
                 columns = top_params.columns
                 top_params["epoch"] = epoch
                 top_params["batch_num"] = batch_num
@@ -129,4 +133,3 @@ if __name__ == "__main__":
     print("Writing metadata")
     with open(os.path.join(output_prefix, "metadata_per_epoch.pkl"), "wb") as f:
         pickle.dump(metadata_per_epoch, f)
-

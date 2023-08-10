@@ -8,7 +8,7 @@ We recommend running this on a machine with an Ampere A4000 GPU or better and 2T
 
 ## Installing dependencies
 
-To generate required dependencies first generate poetry lock file, and then install the packages:
+To generate required dependencies first generate a poetry lock file, and then install the packages:
 
 ```
 poetry lock

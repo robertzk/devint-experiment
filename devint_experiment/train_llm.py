@@ -1,24 +1,27 @@
-import einops
 import json
-from json import JSONEncoder
-import pickle
 import math
-import random
 import os
-import time
+import pickle
+import random
 import sys
+import time
+from json import JSONEncoder
 from tempfile import TemporaryDirectory
-from typing import NamedTuple, List
+from typing import List, NamedTuple
 
+import einops
 import torch
-from torch import nn, Tensor
 import torch.nn.functional as F
+from torch import Tensor, nn
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from torch.utils.data import dataset
 
-from devint_experiment.data import get_batch, get_batched_data, get_wikitext_vocab_iterator
 from devint_experiment.constants import CONTEXT_WINDOW_LENGTH, DEVICE
-from devint_experiment.model import PositionalEncoding, TransformerModel, generate_square_subsequent_mask
+from devint_experiment.data import (get_batch, get_batched_data,
+                                    get_wikitext_vocab_iterator)
+from devint_experiment.model import (PositionalEncoding, TransformerModel,
+                                     generate_square_subsequent_mask)
+
 
 class TrainLogItem:
 
@@ -54,6 +57,10 @@ def log_grads(prefix: str, grads: dict, include_embedding: bool=False) -> None:
 if __name__ == "__main__":
     log_prefix = "single-step/"
     log_single_steps = True
+    log_single_tokens = False
+    # Log gradients for only these tokens if `log_single_tokens` is True.
+    tokens_to_log = ("(", ")")
+
     # Whether or not to include the encoder/decoder units. These are considerably
     # larger than the rest so are typically worth switching off to avoid running
     # out of space.
@@ -114,6 +121,9 @@ if __name__ == "__main__":
         cur_lr = lr # Used to track current learning rate of scheduler.
         output = None
 
+        if log_single_tokens:
+            token_num_values = vocab(list(tokens_to_log))
+
         for batch, i in enumerate(random.sample(list(training_range), k=num_batches)):
             print(".", end="")
             sys.stdout.flush()
@@ -130,12 +140,10 @@ if __name__ == "__main__":
                     continue
 
             grads_record = {}
-            # TODO: Store only the updated weights to save the additional detach/clone op.
-            # This will need a corresponding change in the analysis.
             if not log_single_steps:
                 # Do not log embeddings in single steps for now due to high
                 # space storage utilization.
-                if include_embedding and batch % 100 == 0:
+                if include_embedding and batch % log_embedding_every_n == 0:
                     grads_record["encoder_weights"] = next(model.encoder.parameters()).data.detach().clone()
                     grads_record["decoder_weights"] = next(model.decoder.parameters()).data.detach().clone()
                     grads_record["transformer_encoder_weights"] = {
@@ -168,8 +176,16 @@ if __name__ == "__main__":
                         if include_embedding or name not in ("encoder.weight", "decoder.weight", "decoder.bias")
                     }
                     for j in range(CONTEXT_WINDOW_LENGTH):
-                        k = j*train_batch_size + i
+                        k = j * train_batch_size + i
+                        log_immediately = log_single_tokens and j > 0 and (int(data[j, i]) in token_num_values or int(targets[k]) in token_num_values)
+
+                        new_grads = {
+                            name: torch.zeros_like(param) for name, param in model.named_parameters()
+                            if include_embedding or name not in ("encoder.weight", "decoder.weight", "decoder.bias")
+                        }
+
                         loss[k].backward(retain_graph=True)
+
                         # In the batch step, this is where we could perform gradient clipping
                         # as per below. Instead, we do this after applying all single-datum grads.
                         #   torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -177,11 +193,17 @@ if __name__ == "__main__":
                             if include_embedding or name not in ("encoder.weight", "decoder.weight", "decoder.bias"):
                                 new_grads[name].add_(param.grad.data * -cur_lr / loss.size(0))
                             total_grads[name].add_(param.grad.data)
+                        
+                        if log_immediately:
+                            log_grads(f"{log_prefix}grads_{epoch}/{batch}/{i}/{j}",
+                                      new_grads, include_embedding and batch % log_embedding_every_n == 0)
                         model.zero_grad()
-                    log_grads(f"{log_prefix}grads_{epoch}/{batch}/{i}",
-                            new_grads, include_embedding and batch % log_embedding_every_n == 0)
+                    
+                    if not log_single_tokens:
+                        log_grads(f"{log_prefix}grads_{epoch}/{batch}/{i}",
+                                  new_grads, include_embedding and batch % log_embedding_every_n == 0)
                 
-                # Converse on some space. The backwards graph keeps references to these
+                # Conserve on some space. The backwards graph keeps references to these
                 # so delete them explicitly to trigger GC on the GPU.
                 for key in list(new_grads.keys()):
                     del new_grads[key]
@@ -268,7 +290,6 @@ if __name__ == "__main__":
             with open(f"{log_prefix}grads_{epoch}.json", "w") as f:
                 json.dump(train_log, f, cls=TrainLogJSONEncoder)
 
-    # We don't need this to train the model, but useful to have as a sanity check.
     def evaluate(model: nn.Module, eval_data: Tensor) -> float:
         model.eval()
         total_loss = 0.
@@ -287,7 +308,6 @@ if __name__ == "__main__":
                 loss_criterion = nn.CrossEntropyLoss()
                 total_loss += seq_len * loss_criterion(output_flat, targets).item()
         return total_loss / (len(eval_data) - 1)
-
 
     best_val_loss = float("inf")
 
@@ -325,7 +345,6 @@ if __name__ == "__main__":
           f"| test ppl {test_ppl:8.2f}")
     print("=" * 89)
 
-    # Check the train_log
     torch.save(model.state_dict(), f"{log_prefix}trained_model.pt")
 
     # Leave a debugger on in case we want to examine any local variables

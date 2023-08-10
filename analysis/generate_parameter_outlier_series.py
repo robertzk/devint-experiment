@@ -1,27 +1,31 @@
+import json
+import re
+import sys
+from collections import namedtuple
 import bisect
 import functools
-import json
-import math
-import os
-import pickle
-from collections import namedtuple
 from typing import Dict
 
 import numpy as np
 import pandas as pd
 import torch
+from torch import Tensor
+import math
+import os
+import pickle
+
+import pandas as pd
 import tqdm
 import tqdm.notebook
-from torch import Tensor
 
 num_epochs = 5
 num_batches = 2920
 batch_size = 20
 training_item = namedtuple("training_item", "id datum")
-prefix = "single-step/"
+prefix = "single-step3"
 
 def read_metadata(epoch: int):
-    with open(f"{prefix}grads_{epoch}.json", "r") as f:
+    with open(os.path.join(prefix, f"grads_{epoch}.json"), "r") as f:
         return json.load(f)
 
 def add_training_identifier(metadata: dict) -> dict:
@@ -63,33 +67,50 @@ def collect_top_parameters(tensors: Dict[str, Tensor], n: int = 100) -> pd.DataF
     return pd.DataFrame({"unit": units, "flat_index": flat_indices,
                          "value": flattened_tensor[abs_indices_object.indices].tolist(),
                          "abs_value": abs_indices_object.values.tolist()})
-
+    
 def read_grads(path: str) -> Tensor:
     with open(path, "rb") as f:
         return pickle.loads(f.read()).to("cuda")
 
 if __name__ == "__main__":
-    num_layers = 3
-
     metadata_per_epoch = {
         epoch: [add_training_identifier(m) for m in read_metadata(epoch)] for epoch in range(1, num_epochs + 1)
     }
 
     training_ids = sorted(list(set(y.id for m in metadata_per_epoch.values() for x in m for y in x["data_batch"])))
 
-    full_data_attribution = []
-    topk_cutoff = 1000
-    output_prefix = os.path.join(prefix, "analysis", str(topk_cutoff))
-    output_columns = []
+    num_layers = 3
+    num_epochs = 5
 
+    units_of_interest = (
+        "transformer_encoder.layers.2.linear1.weight"
+        "transformer_encoder.layers.1.linear1.weight",
+        "transformer_encoder.layers.0.linear1.weight"
+    )
+
+
+    full_data_attribution = []
+
+    layers_re = re.compile(".*layers.([0-9]+)\..*")
+    topk_cutoff = 10_000
+
+    output_prefix = os.path.join(prefix, "analysis", "local")
+
+    output_columns = []
     count = 0
 
-    for epoch in tqdm.tqdm(range(1, num_epochs + 1), total=num_epochs):
-        for batch_num in tqdm.tqdm(range(0, num_batches), total=num_batches):
+    os.makedirs(output_prefix, exist_ok=True)
+
+    for epoch in range(1, num_epochs + 1):
+        for batch_num in range(0, num_batches):
+            print(".", end="")
+            sys.stdout.flush()
 
             if count > 0 and count % 100 == 0:
                 data_attribution = pd.DataFrame(full_data_attribution, columns=output_columns)
                 data_attribution.to_csv(os.path.join(output_prefix, str(count // 100)), index=False)
+                print("*", end="")
+                sys.stdout.flush()
                 full_data_attribution = []
 
             count += 1
@@ -100,6 +121,8 @@ if __name__ == "__main__":
                 tensors = {}
                 for dir, dirs, files in os.walk(full_prefix):
                     for file in files:
+                        if file not in units_of_interest:
+                            continue
                         if "layers." in file:
                             layer = int(file.split("layers.")[1].split(".")[0])
                             # Ignore layers that were constructed from previous runs.
@@ -114,8 +137,10 @@ if __name__ == "__main__":
                     continue
 
                 # Top 1000 most significant parameter updates
-                top_params = collect_top_parameters(tensors, n=1000).sort_values("value", ascending=False)
+                top_params = collect_top_parameters(tensors, n=topk_cutoff).sort_values("value", ascending=False)
+
                 columns = top_params.columns
+                top_params["unit"] = [int(layers_re.match(u)[1]) for u in top_params["unit"]]
                 top_params["epoch"] = epoch
                 top_params["batch_num"] = batch_num
                 top_params["datum_ind"] = i
@@ -123,10 +148,9 @@ if __name__ == "__main__":
                 top_params["datum_id"] = datum_id
                 top_params = top_params[["epoch", "batch_num", "datum_ind", "datum_id", *columns]]
                 output_columns = ["epoch", "batch_num", "datum_ind", "datum_id", *columns]
-
+                
                 full_data_attribution.extend(list(top_params.itertuples(index=False, name=None)))
 
-    print("Writing metadata")
-    with open(os.path.join(output_prefix, "metadata_per_epoch.pkl"), "wb") as f:
+    print("Saving full data attribution\n\n")
+    with open(os.path.join(prefix, "analysis/local/metadata_per_epoch_L1.pkl"), "wb") as f:
         pickle.dump(metadata_per_epoch, f)
-

@@ -1,18 +1,34 @@
-import _io
-from collections import Counter, defaultdict, namedtuple
 import functools
-from itertools import chain, groupby
 import math
 import os
-import pandas as pd
 import pickle
-import torch
 import random
 import re
 import tempfile
+from collections import Counter, defaultdict, namedtuple
+from itertools import chain, groupby
+from typing import Any, Callable, Dict, Generator, List, Optional, Set, Tuple
+
+import _io
+import pandas as pd
+import torch
 import tqdm
 from torch import Tensor
-from typing import Any, Callable, Dict, Generator, List, Optional, Set, Tuple
+import math
+from typing import List, Optional, Tuple
+
+from devint_experiment.model import TransformerModel, generate_square_subsequent_mask
+from devint_experiment.data import get_wikitext_vocab_iterator, get_batched_data, get_data_tensor
+from devint_experiment.constants import DEVICE, CONTEXT_WINDOW_LENGTH
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from torch.utils.data import IterableDataset, dataset
+from torchtext.data.utils import get_tokenizer
+from torchtext.datasets import WikiText2
+from torchtext.vocab import Vocab, build_vocab_from_iterator
 
 log_prefix = "single-step"
 
@@ -23,16 +39,15 @@ config = {
     "parameter_batches_limit": 50,
     "mlp_neuron_analysis_limit": 50,
     "random_train_data_sample_size": 2000,
-    "metadata_per_epoch_file": f"{log_prefix}/metadata_per_epoch.pkl",
-    "full_data_attribution_dir": f"{log_prefix}/analysis/1000",
-    "relative_distributions_file": f"{log_prefix}/analysis/relative_distributions.csv",
-    "full_distributions_file": f"{log_prefix}/analysis/full_distributions.csv",
-    "ablation_analysis_file": f"{log_prefix}/analysis/ablation_analysis.pkl",
-    "trained_model_path": f"{log_prefix}/trained_model.pt",
+    "metadata_per_epoch_file": os.path.join(log_prefix, "metadata_per_epoch.pkl"),
+    "full_data_attribution_dir": os.path.join(log_prefix, "analysis", str(1000)),
+    "relative_distributions_file": os.path.join(log_prefix, "analysis", "relative_distributions.csv"),
+    "full_distributions_file": os.path.join(log_prefix, "analysis", "full_distributions.csv"),
+    "ablation_analysis_file": os.path.join(log_prefix, "analysis", "ablation_analysis.pkl"),
+    "trained_model_path": os.path.join(log_prefix, "trained_model.pt"),
 }
 
 parameter_group = namedtuple("parametergroup", "unit flat_index")
-
 
 def read_grads(path: str) -> Tensor:
     with open(path, "rb") as f:
@@ -76,10 +91,6 @@ def get_counts_by_full_attribution_file(filepath: str, tensors_2d: List[str]=get
         filtered_data_attribution(filepath, lambda line: any(f"{t}," in line for t in tensors_2d),
                                   pd_args={"usecols": ["unit", "flat_index"]})
     )
-
-    #df = pd.read_csv(filepath, usecols=["unit", "flat_index"])
-    #df = df[df.unit.isin(tensors_2d)]
-    #return get_counts_by_parameter(df)
 
 def get_counts_by_filtered_data_attribution(filepath: str, filter: Callable[[str], bool], *, pd_args: Dict[Any, Any] = {}) -> pd.DataFrame:
     counter = Counter()
@@ -240,7 +251,7 @@ class DistributionShiftCalculator:
 
     def get_relative_distribution(self, attribution_frame: pd.DataFrame,
                                   frequency_cutoff: int = 1,
-                                  compute_mdistance: bool = True) -> pd.DataFrame:
+                                  compute_mdistance: bool = False) -> pd.DataFrame:
         """
         Produce token distribution for parameter attributed example 
         and relative frequencies to full training data.
@@ -262,8 +273,8 @@ class DistributionShiftCalculator:
         )
         
         if compute_mdistance:
-            #distances, outliers = calc_mahalanobis_distances(relative_distribution[["count", "relative_freq"]])
-            #relative_distribution["mdistance"] = distances
+            distances, outliers = calc_mahalanobis_distances(relative_distribution[["count", "relative_freq"]])
+            relative_distribution["mdistance"] = distances
             pass
             
         return relative_distribution
@@ -287,153 +298,10 @@ class DistributionShiftCalculator:
         else:
             return relative_distribution
 
+
+### 
 ###  Ablation related logic
-import torch
-from torch import nn, Tensor
-import torch.nn.functional as F
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
-from torch.utils.data import dataset
-
-import math
-from torchtext.datasets import WikiText2
-from torchtext.data.utils import get_tokenizer
-from torchtext.vocab import build_vocab_from_iterator, Vocab
-
-from torch import nn, Tensor
-from torch.utils.data import IterableDataset
-from typing import List, Optional, Tuple
-
-
-class PositionalEncoding(nn.Module):
-
-    def __init__(self, dim_model: int, dropout: float = 0.1, max_len: int = 5000) -> None:
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, dim_model, 2) * (-math.log(10_000.0) / dim_model))
-        pe = torch.zeros(max_len, 1, dim_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.sin(position * div_term)
-        self.register_buffer("pe", pe)
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Arguments:
-            x: Tensor, shape src: ``[seq_len, batch_size]``
-        """
-        x = x + self.pe[:x.size(0)]
-        return self.dropout(x)
-
-class TransformerModel(nn.Module):
-
-    def __init__(self, num_tokens: int, dim_model: int, num_heads: int,
-                 dim_hidden: int, num_layers: int, dropout: float = 0.5):
-        super().__init__()
-        self.model_type = 'Transformer'
-        self.pos_encoder = PositionalEncoding(dim_model, dropout)
-        self.pos_encoder.requires_grad = True
-        encoder_layers = TransformerEncoderLayer(dim_model, num_heads, dim_hidden, dropout)
-        self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers)
-        self.transformer_encoder.requires_grad = True
-        self.encoder = nn.Embedding(num_tokens, dim_model)
-        self.encoder.requires_grad = True
-        self.dim_model = dim_model
-        self.decoder = nn.Linear(dim_model, num_tokens)
-        self.decoder.requires_grad = True
-        self.init_weights()
-    
-    def init_weights(self) -> None:
-        initrange = 0.1
-        self.encoder.weight.data.uniform_(-initrange, initrange)
-        self.decoder.bias.data.zero_()
-        self.decoder.weight.data.uniform_(-initrange, initrange)
-    
-    def forward(self, src: Tensor, src_mask: Tensor) -> Tensor:
-        """
-        Arguments:
-            src: Tensor, shape ``[seq_len, batch_size]``
-            src_mask: Tensor, shape ``[seq_len, batch_size]``
-            
-        Returns:
-            output Tensor of shape ``[seq_len, batch_size, num_tokens]``
-        """
-
-        src = self.encoder(src) * math.sqrt(self.dim_model)
-        src = self.pos_encoder(src)
-
-        output = self.transformer_encoder(src, src_mask)
-        output = self.decoder(output)
-
-        return output 
-
-
-def get_wikitext_vocab_iterator() -> Vocab:
-    train_iter = WikiText2(split="train")
-    tokenizer = get_tokenizer("basic_english")
-    vocab = build_vocab_from_iterator((tokenizer(x) for x in train_iter), specials=["<unk>"])
-    vocab.set_default_index(vocab["<unk>"])
-    return vocab
-
-DEVICE = "cuda"
-vocab = get_wikitext_vocab_iterator()
-num_tokens = len(vocab)
-embedding_dimension = 200
-hidden_dimension = 200
-num_layers = 3
-num_heads = 4
-dropout = 0.2
-model = TransformerModel(num_tokens, embedding_dimension, num_heads, hidden_dimension,
-                         num_layers, dropout).to(DEVICE)
-
-train_batch_size = 20
-eval_batch_size = 2
-
-tokenizer = get_tokenizer("basic_english")
-
-def generate_square_subsequent_mask(sz: int) -> Tensor:
-    """Generates an upper-triangular matrix of ``-inf``, with zeros on ``diag``."""
-    return torch.triu(torch.ones(sz, sz) * float('-inf'), diagonal=1)
-
-CHUNK_LENGTHS = 35
-src_mask = generate_square_subsequent_mask(CHUNK_LENGTHS).to(DEVICE)
-
-
-def get_data_tensor(vocab: Vocab, raw_text_iter) -> Tensor:
-    """Converts raw text into a flat Tensor."""
-    tokenizer = get_tokenizer("basic_english")
-    data = [torch.tensor(vocab(tokenizer(item)), dtype=torch.long) for item in raw_text_iter]
-    return torch.cat(tuple(filter(lambda t: t.numel() > 0, data))).to(DEVICE)
-
-def batchify(data: Tensor, batch_size: int) -> Tensor:
-    """
-    Divides the data into ``batch_size`` separate sequences, removing extra elements
-    that would not cleanly fit.
-    
-    Arguments:
-        data: Tensor, shape [N]
-        batch_size: int, batch size
-    
-    Returns:
-        Tensor of shape ``[N // batch_size, batch_size]``
-    """
-    seq_len = data.size(0) // batch_size
-    data = data[:seq_len * batch_size]
-    data = data.view(batch_size, seq_len).t().contiguous()
-    return data.to(DEVICE)
-
-def get_batched_data(vocab: Vocab, batch_size: int = 20, eval_batch_size: int = 10) -> Tuple[Tensor, Tensor, Tensor]:
-    train_iter, val_iter, test_iter = WikiText2()
-    train_data = get_data_tensor(vocab, train_iter)
-    val_data = get_data_tensor(vocab, val_iter)
-    test_data = get_data_tensor(vocab, test_iter)
-
-    train_data = batchify(train_data, batch_size)
-    val_data = batchify(val_data, eval_batch_size)
-    test_data = batchify(test_data, eval_batch_size)
-    return train_data, val_data, test_data
-
-train_data, val_data, test_data = get_batched_data(vocab, train_batch_size, eval_batch_size)
+###
 
 def get_change_region(df: pd.DataFrame, all_diffs: bool = False, n: int = 2) -> pd.DataFrame:
     """
@@ -464,14 +332,14 @@ def generate_predict_batch(model: TransformerModel, data: List[str]) -> pd.DataF
     # Ensure all datums have the same number of tokens.
     assert(len(set(len(datum.split(" ")) for datum in data)) == 1)
     datums = get_data_tensor(vocab, (" ".join(data)).split(" "))
-    datums = datums.reshape((datums.shape[0] // CHUNK_LENGTHS, CHUNK_LENGTHS)).T
+    datums = datums.reshape((datums.shape[0] // CONTEXT_WINDOW_LENGTH, CONTEXT_WINDOW_LENGTH)).T
 
     targets = torch.cat((
         datums[1:, :],
         torch.full([1, datums.shape[1]], vocab(tokenizer("."))[0]).to(DEVICE),
     ), dim=0).reshape(-1)
 
-    src_mask = generate_square_subsequent_mask(CHUNK_LENGTHS).to(DEVICE)
+    src_mask = generate_square_subsequent_mask(CONTEXT_WINDOW_LENGTH).to(DEVICE)
 
     model.eval()
     with torch.no_grad():
@@ -486,7 +354,7 @@ def generate_predict_batch(model: TransformerModel, data: List[str]) -> pd.DataF
         preds = vocab.lookup_tokens(output_flat[i::num_examples].argmax(axis=1).tolist())
         tgts = vocab.lookup_tokens(targets[i::num_examples].tolist())
         correct = [1 if x == y else 0 for x, y in zip(tgts, preds)]
-        key = [f"{i}-{j}" for j in range(CHUNK_LENGTHS)]
+        key = [f"{i}-{j}" for j in range(CONTEXT_WINDOW_LENGTH)]
         rows.append(pd.DataFrame({"key": key, "datum": datum, "pred": preds, "correct": correct}))
 
     outputs = pd.concat(rows)
@@ -574,11 +442,29 @@ class ModelEffectVerifier:
 ### End model ablation related
 
 if __name__ == "__main__":
+    vocab = get_wikitext_vocab_iterator()
+    num_tokens = len(vocab)
+    embedding_dimension = 200
+    hidden_dimension = 200
+    num_layers = 3
+    num_heads = 4
+    dropout = 0.2
+    model = TransformerModel(num_tokens, embedding_dimension, num_heads, hidden_dimension, num_layers, dropout).to(DEVICE)
+
+    train_batch_size = 20
+    eval_batch_size = 2
+
+    tokenizer = get_tokenizer("basic_english")
+
+    CONTEXT_WINDOW_LENGTH = 35
+    src_mask = generate_square_subsequent_mask(CONTEXT_WINDOW_LENGTH).to(DEVICE)
+
+    train_data, val_data, test_data = get_batched_data(vocab, train_batch_size, eval_batch_size)
+    
     counter = get_most_common_parameters()
     distribution_shift_calc = DistributionShiftCalculator()
     verifier = ModelEffectVerifier()
 
-    # unit, flat_index = counter.most_common(1)[0][0]
     most_common = counter.most_common()
 
     params_groups = [
@@ -614,16 +500,7 @@ if __name__ == "__main__":
             relative_distributions.to_csv(config["relative_distributions_file"])
             full_relative_distributions.to_csv(config["full_distributions_file"])
 
-    #unit, flat_index = "transformer_encoder.layers.2.linear1.weight", 3278
-    #attribution_frame = extract_parameter_from_full_attribution(unit, flat_index)
-
-    #relative_distribution, full_distribution = distribution_shift_calc.get_filtered_relative_distribution(attribution_frame, full_distribution=True)
-    #relative_distribution["unit"] = unit
-    #relative_distribution["flat_index"] = flat_index
-    #full_distribution["unit"] = unit
-    #full_distribution["flat_index"] = flat_index
-
-    # TODO: For each neuron, perform zero-ablation exercise.
+    # For each neuron, perform zero-ablation exercise.
     # - Determine proportion of prediction flips after ablation for identified *notable tokens*
     # - Determine proportion of prediction flips after ablation on random sample of training data
     # - Compare results
@@ -644,7 +521,6 @@ if __name__ == "__main__":
     print("Computing attribution data")
     attribution_frame = extract_parameter_from_full_attribution_batch(set(list(chain(*neurons.values()))))
     attribution_frame = distribution_shift_calc.replace_datum_ids_and_add_datum(attribution_frame)
-    #random_data = distribution_shift_calc.random_train_data_sample(config["random_train_data_sample_size"])
 
     print(f"Generating predictions for {len(neurons)} MLP neurons")
     for neuron, group in tqdm.tqdm(neurons.items()):
@@ -668,7 +544,7 @@ if __name__ == "__main__":
         
         def compute_token_summaries(data):
             _, _, changes = verifier.check_replacement_rate(index, token, data=data,
-                                                            unit=clean_unit, show_changes=True, change_window = CHUNK_LENGTHS)
+                                                            unit=clean_unit, show_changes=True, change_window = CONTEXT_WINDOW_LENGTH)
             switched_preds_summary = {
                 "unit": unit,
                 "index": index,
@@ -716,7 +592,8 @@ if __name__ == "__main__":
             return switched_preds_summary
 
         neuron_analysis[neuron] = compute_token_summaries(attributed_data)
-        # TODO: Add analysis on random data
+
+        # TODO: Add comparative analysis on random data.
 
         with open(config["ablation_analysis_file"], "wb") as f:
             pickle.dump(neuron_analysis, f)
