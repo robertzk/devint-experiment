@@ -17,10 +17,10 @@ poetry install
 
 ## Training a model
 
-Train a model and generate the required gradient data. It will be saved to the directory specified by the `log_prefix` variable in `train_llm.py`.
+Train a model and generate the required gradient data. It will be saved to the directory specified by the `log_prefix` variable in `main.py`.
 
 ```
-poetry run devint_experiment/train_llm.py
+poetry run devint_experiment/main.py
 ```
 
 Once this succeeds, all gradient data should be available in the `log_prefix`.
